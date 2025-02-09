@@ -1,4 +1,5 @@
-import jax
+# Adapted from https://github.com/cloneofsimo/minDinoV2
+import jax, math
 from jax import Array, numpy as jnp
 from flax import nnx
 from einops import rearrange
@@ -6,6 +7,22 @@ from einops import rearrange
 
 xavier_init = nnx.initializers.xavier_uniform()
 zero_init = nnx.initializers.constant(0)
+
+
+def linear_bicubic_interpolate(x, size=None):
+    in_shape = x.shape
+
+    scale_factors = tuple(o / i for o, i in zip(size, in_shape[2:]))
+
+    n, c, l_out = jnp.indices((x.shape[0], x.shape[1]) + size)
+    l_in_float = l_out / scale_factors[0]
+    l_in = jnp.floor(l_in_float).astype(int)
+    l_in_next = jnp.clip(l_in + 1, 0, in_shape[2] - 1)
+    l_weight = l_in_float - l_in
+    interpolated_values = (1 - l_weight) * x[n, c, l_in] + l_weight * x[n, c, l_in_next]
+
+    return interpolated_values
+
 
 class Mlp(nnx.Module):
     def __init__(self, in_feat, out_feat, hidden, bias=True, act_layer=nnx.gelu):
@@ -65,7 +82,7 @@ class PatchEmbed(nnx.Module):
         )
 
         return x
-    
+
 class Attention(nnx.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False):
         super().__init__()
@@ -86,3 +103,115 @@ class Attention(nnx.Module):
         x = self.out_project(x)
         
         return x
+
+class LayerScale(nnx.Module):
+    def __init__(self, dim, init_val=1e-5, inplace=False):
+        super().__init__()
+        self.inplace = inplace
+        self.gamma = nnx.Param(jnp.ones((dim)))
+    
+    def __call__(self, x):
+        return x * self.gamma.value
+
+
+class Block(nnx.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.norm_1 = nnx.LayerNorm(dim, scale_init=zero_init)
+        self.attn = Attention(dim, num_heads)
+        self.ls_1 = LayerScale(dim)
+        self.norm_2 = nnx.LayerNorm(dim)
+
+        self.mlp = Mlp(dim, hidden=int(dim*mlp_ratio))
+        self.ls_2 = LayerScale(dim)
+
+    def __call__(self, x):
+        x = x + self.ls_1(self.attn(self.norm_1(x)))
+        x = x + self.ls_2(self.mlp(self.norm_2(x)))
+
+        return x
+
+class DinoViT(nnx.Module):
+    def __init__(
+        self, img_size=224, patch_size=16, in_channels=3, embed_dim=768,
+        depth=12, num_heads=12, mlp_ratio=4, interpolate_offset=0.1,
+        num_reg_tokens=0 
+    ):
+        super().__init__()
+        self.num_features = self.embed_dim = embed_dim
+        self.num_tokens = 1
+        self.depth = depth
+        self.patch_size = patch_size
+        self.num_heads = num_heads
+        self.patch_embed = PatchEmbed(img_size, patch_size, embed_dim=embed_dim)
+
+        self.cls_token = nnx.Param(jnp.zeros((1, 1, embed_dim)))
+        self.pos_embed = nnx.Param(jnp.zeros((1, 1370, embed_dim)))
+
+        self.register_tokens = nnx.Param(jnp.zeros((1, num_reg_tokens, embed_dim))) if num_reg_tokens else None
+
+        layer_list = [Block(embed_dim, num_heads, mlp_ratio) for _ in range(depth)]
+        self.layers = nnx.Sequential(*layer_list)
+
+        self.norm = nnx.LayerNorm(embed_dim)
+
+        self.mask_token = nnx.Param(jnp.zeros((1, embed_dim)))
+
+    def interpolate_posencoding(self, x, h, w):
+        npatches = x.shape[1] - 1
+        N = self.pos_embed.value.shape[1] - 1
+
+        if npatches == N and w == h:
+            return self.pos_embed.value
+
+        pos_embed = self.pos_embed.value.float()
+        class_pos_embed = pos_embed[:, 0]
+        patch_pos_embed = pos_embed[:, 1:]
+        dim = x.shape[-1]
+        w0, h0 = w // self.patch_size, h // self.patch_size
+        M = int(math.sqrt(N))
+
+        kwargs = {}
+        assert N == M * M
+        kwargs['size'] = (w0, h0)
+
+        patch_pos_embed = patch_pos_embed.reshape((1, M, M, dim)).transpose(0, 3, 1, 2)
+        patch_pos_embed = linear_bicubic_interpolate(patch_pos_embed, size=kwargs['size']).transpose(0, 2, 3, 1)
+
+        return jnp.concat((class_pos_embed[None], patch_pos_embed), axis=1)
+
+    def _prepare_tokens_with_masks(self, x, masks=None):
+        b, h, w, c = x.shape
+        x = self.patch_embed(x)
+        if masks is not None:
+            x = jnp.where(masks[..., None], self.mask_token.value[None], x)
+
+        exp_cls = jnp.repeat(self.cls_token.value, b, axis=0)
+        x = jnp.concat([exp_cls, x], axis=1)
+
+        x = x + self.interpolate_posencoding(x, h, w)
+        if self.register_tokens is not None:
+            exp_reg = jnp.repeat(self.register_tokens.value, b, axis=0)
+            x = jnp.concat([x[:, :1], exp_reg, x[:, 1:]])
+
+        return x
+
+    def __call__(self, x, masks=None):
+        x = self._prepare_tokens_with_masks(x, masks)    
+        x = self.layers(x)
+        x = self.norm(x)
+
+        return x
+
+
+def vit_small(patch_size=14, num_register_tokens=0, **kwargs):
+    return DinoViT(
+        img_size=518,
+        patch_size=patch_size,
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        mlp_ratio=4,
+        num_register_tokens=num_register_tokens,
+        **kwargs,
+    )
