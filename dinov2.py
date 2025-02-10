@@ -4,7 +4,7 @@ from jax import Array, numpy as jnp
 from flax import nnx
 from einops import rearrange
 
-
+rngs = nnx.Rngs(123)
 xavier_init = nnx.initializers.xavier_uniform()
 zero_init = nnx.initializers.constant(0)
 
@@ -29,15 +29,19 @@ class Mlp(nnx.Module):
         super().__init__()
         hidden = hidden or in_feat
         out_feat = out_feat or in_feat
-        
-        self.lin_1 = nnx.Linear(in_feat, hidden, use_bias=bias, kernel_init=xavier_init)
-        self.act = act_layer
-        self.lin_2 = nnx.Linear(hidden, out_feat, use_bias=bias, kernel_init=xavier_init)
-        
+
+        self.fc1 = nnx.Linear(
+            in_feat, hidden, use_bias=bias, kernel_init=xavier_init, rngs=rngs
+        )
+        self.activation = act_layer
+        self.fc2 = nnx.Linear(
+            hidden, out_feat, use_bias=bias, kernel_init=xavier_init, rngs=rngs
+        )
+
     def __call__(self, x):
-        x = self.act(self.lin_1(x))
-        x = self.lin_2(x)
-        
+        x = self.activation(self.fc1(x))
+        x = self.fc2(x)
+
         return x
 
 class SwigluFFN(nnx.Module):
@@ -45,16 +49,20 @@ class SwigluFFN(nnx.Module):
         super().__init__()
         outfeat = infeat
         hidden = hidden or infeat
-        
-        self.w_12 = nnx.Linear(infeat, 2*hidden, use_bias=False, kernel_init=xavier_init)
-        self.w_3 = nnx.Linear(hidden, outfeat, kernel_init=xavier_init, use_bias=True)
-        
+
+        self.weights_in = nnx.Linear(
+            infeat, 2 * hidden, use_bias=False, kernel_init=xavier_init, rngs=rngs
+        )
+        self.weights_out = nnx.Linear(
+            hidden, outfeat, kernel_init=xavier_init, use_bias=True, rngs=rngs
+        )
+
     def __call__(self, x):
-        x_12 = self.w_12(x)
+        x_12 = self.weights_in(x)
         x_1, x_2 = jnp.array_split(x_12, 2, axis=-1)
         hidden = nnx.silu(x_1) * x_2
-        
-        return self.w_3(hidden)
+
+        return self.weights_out(hidden)
 
 class PatchEmbed(nnx.Module):
     def __init__(self, img_size=224, patch_size=16, in_channel=3, embed_dim=768):
@@ -62,13 +70,15 @@ class PatchEmbed(nnx.Module):
         img_size = (img_size, img_size)
         patch_size = (patch_size, patch_size)
 
+        self.num_channels = self.num_channels
         self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
         self.embed_dim = embed_dim
         self.num_patches = self.grid_size[0] * self.grid_size[1]
-        self.conv_proj = nnx.Conv(
-            in_channel, embed_dim, 
+        self.projection = nnx.Conv(
+            in_channel, embed_dim,
             kernel_size=patch_size, strides=patch_size,
-            kernel_init=xavier_init, use_bias=False
+            kernel_init=xavier_init, use_bias=False,
+            rngs=rngs
         )
 
     def __call__(self, x):
@@ -76,7 +86,7 @@ class PatchEmbed(nnx.Module):
         num_patches_side_h = H // self.patch_size
         num_patches_side_w = W // self.patch_size
 
-        x = self.conv_project(x)  # (B, P, P, hidden_size)
+        x = self.projection(x)  # (B, P, P, hidden_size)
         x = rearrange(
             x, "b h w c -> b (h w) c", h=num_patches_side_h, w=num_patches_side_w
         )
@@ -84,31 +94,45 @@ class PatchEmbed(nnx.Module):
         return x
 
 class Attention(nnx.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, drop=0.0):
         super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        
-        self.scale = head_dim ** -0.5
-        self.qkv = nnx.Linear(dim, dim * 3, use_bias=qkv_bias, kernel_init=xavier_init)
-        self.out_project = nnx.Linear(dim, dim, kernel_init=xavier_init, bias_init=zero_init)
-    
+        self.num_attention_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.scale = self.head_dim ** -0.5
+        self.query = nnx.Linear(
+            dim, dim, use_bias=qkv_bias, kernel_init=xavier_init, rngs=rngs
+        )
+        self.key = nnx.Linear(
+            dim, dim, use_bias=qkv_bias, rngs=rngs, kernel_init=xavier_init
+        )
+        self.value = nnx.Linear(
+            dim, dim, use_bias=qkv_bias, rngs=rngs, kernel_init=xavier_init
+        )
+
+        self.output = nnx.Linear(
+            dim, dim, rngs=rngs, kernel_init=xavier_init, bias_init=zero_init
+        )
+        self.dropout = nnx.Dropout(0.0, rngs=rngs)
+
     def __call__(self, x):
         B, N, C = x.shape
-        qkv = self.qkv(x)
-        qkv = jnp.reshape(qkv, (B, N, 3, self.num_heads, C // self.num_heads)).transpose(2, 0, 1, 3, 4)
-        q, k, v = jnp.array_split(qkv, 3, axis=0)
+
+        q = jnp.reshape(self.query(x), (B, N, self.num_attention_heads, self.head_dim))
+        k = jnp.reshape(self.key(x), (B, N, self.num_attention_heads, self.head_dim))
+        v = jnp.reshape(self.value(x), (B, N, self.num_attention_heads, self.head_dim))
+
         x = nnx.dot_product_attention(q, k, v)
         x = x.reshape((B, N, C))
-        x = self.out_project(x)
-        
+        x = self.output(x)
+
         return x
 
 class LayerScale(nnx.Module):
     def __init__(self, dim, init_val=1e-5, inplace=False):
         super().__init__()
         self.inplace = inplace
-        self.gamma = nnx.Param(jnp.ones((dim)))
+        self.gamma = nnx.Param(init_val * jnp.ones((dim)))
     
     def __call__(self, x):
         return x * self.gamma.value
@@ -117,24 +141,24 @@ class LayerScale(nnx.Module):
 class Block(nnx.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4.0):
         super().__init__()
-        self.norm_1 = nnx.LayerNorm(dim, scale_init=zero_init)
-        self.attn = Attention(dim, num_heads)
-        self.ls_1 = LayerScale(dim)
-        self.norm_2 = nnx.LayerNorm(dim)
+        self.norm1 = nnx.LayerNorm(dim, scale_init=zero_init)
+        self.attention = Attention(dim, num_heads)
+        self.layer_scale1 = LayerScale(dim)
+        self.norm2 = nnx.LayerNorm(dim)
 
         self.mlp = Mlp(dim, hidden=int(dim*mlp_ratio))
-        self.ls_2 = LayerScale(dim)
+        self.layer_scale2 = LayerScale(dim)
 
     def __call__(self, x):
-        x = x + self.ls_1(self.attn(self.norm_1(x)))
-        x = x + self.ls_2(self.mlp(self.norm_2(x)))
+        x = x + self.layer_scale1(self.attention(self.norm1(x)))
+        x = x + self.layer_scale2(self.mlp(self.norm2(x)))
 
         return x
 
 class DinoViT(nnx.Module):
     def __init__(
-        self, img_size=224, patch_size=16, in_channels=3, embed_dim=768,
-        depth=12, num_heads=12, mlp_ratio=4, interpolate_offset=0.1,
+        self, img_size=518, patch_size=14, in_channels=3, embed_dim=384,
+        depth=12, num_heads=6, mlp_ratio=4, interpolate_offset=0.1,
         num_reg_tokens=0 
     ):
         super().__init__()
@@ -150,10 +174,10 @@ class DinoViT(nnx.Module):
 
         self.register_tokens = nnx.Param(jnp.zeros((1, num_reg_tokens, embed_dim))) if num_reg_tokens else None
 
-        layer_list = [Block(embed_dim, num_heads, mlp_ratio) for _ in range(depth)]
-        self.layers = nnx.Sequential(*layer_list)
+        self.layer = [Block(embed_dim, num_heads, mlp_ratio) for _ in range(depth)]
+        # self.layers = nnx.Sequential(*layer_list)
 
-        self.norm = nnx.LayerNorm(embed_dim)
+        self.layernorm = nnx.LayerNorm(embed_dim)
 
         self.mask_token = nnx.Param(jnp.zeros((1, embed_dim)))
 
@@ -197,9 +221,12 @@ class DinoViT(nnx.Module):
         return x
 
     def __call__(self, x, masks=None):
-        x = self._prepare_tokens_with_masks(x, masks)    
-        x = self.layers(x)
-        x = self.norm(x)
+        x = self._prepare_tokens_with_masks(x, masks) 
+        
+        for vitblock in self.layer:   
+            x = vitblock(x)
+            
+        x = self.layernorm(x)
 
         return x
 
