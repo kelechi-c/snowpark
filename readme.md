@@ -2,6 +2,8 @@
 
 research/experiments on **multimodal** models, **adapters**, etc. (the implementations are in **JAX** btw)
 
+### updates
+- [**11/02/2025**] - **dinov2** model ([**impl/conversion**](./dino_v2_jax/))
 
 ### acknowledgement
 - the mighty [**transformers**](https://github.com/huggingface/transformers) library 
