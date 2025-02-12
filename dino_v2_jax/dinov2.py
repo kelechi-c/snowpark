@@ -1,3 +1,7 @@
+from functools import partial
+import math
+import torch
+
 # Adapted from https://github.com/cloneofsimo/minDinoV2
 import jax, math
 from jax import Array, numpy as jnp
@@ -25,7 +29,9 @@ def linear_bicubic_interpolate(x, size=None):
 
 
 class Mlp(nnx.Module):
-    def __init__(self, in_feat, out_feat, hidden, bias=True, act_layer=nnx.gelu):
+    def __init__(
+        self, in_feat, out_feat=None, hidden=None, bias=True, act_layer=nnx.gelu
+    ):
         super().__init__()
         hidden = hidden or in_feat
         out_feat = out_feat or in_feat
@@ -43,6 +49,7 @@ class Mlp(nnx.Module):
         x = self.fc2(x)
 
         return x
+
 
 class SwigluFFN(nnx.Module):
     def __init__(self, infeat, hidden):
@@ -64,21 +71,25 @@ class SwigluFFN(nnx.Module):
 
         return self.weights_out(hidden)
 
+
 class PatchEmbed(nnx.Module):
     def __init__(self, img_size=224, patch_size=16, in_channel=3, embed_dim=768):
         super().__init__()
         img_size = (img_size, img_size)
         patch_size = (patch_size, patch_size)
 
-        self.num_channels = self.num_channels
+        self.num_channels = in_channel
         self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
         self.embed_dim = embed_dim
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.projection = nnx.Conv(
-            in_channel, embed_dim,
-            kernel_size=patch_size, strides=patch_size,
-            kernel_init=xavier_init, use_bias=False,
-            rngs=rngs
+            in_channel,
+            embed_dim,
+            kernel_size=patch_size,
+            strides=patch_size,
+            kernel_init=xavier_init,
+            use_bias=False,
+            rngs=rngs,
         )
 
     def __call__(self, x):
@@ -93,13 +104,14 @@ class PatchEmbed(nnx.Module):
 
         return x
 
+
 class Attention(nnx.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, drop=0.0):
         super().__init__()
         self.num_attention_heads = num_heads
         self.head_dim = dim // num_heads
 
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
         self.query = nnx.Linear(
             dim, dim, use_bias=qkv_bias, kernel_init=xavier_init, rngs=rngs
         )
@@ -128,12 +140,13 @@ class Attention(nnx.Module):
 
         return x
 
+
 class LayerScale(nnx.Module):
     def __init__(self, dim, init_val=1e-5, inplace=False):
         super().__init__()
         self.inplace = inplace
         self.gamma = nnx.Param(init_val * jnp.ones((dim)))
-    
+
     def __call__(self, x):
         return x * self.gamma.value
 
@@ -141,12 +154,12 @@ class LayerScale(nnx.Module):
 class Block(nnx.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4.0):
         super().__init__()
-        self.norm1 = nnx.LayerNorm(dim, scale_init=zero_init)
+        self.norm1 = nnx.LayerNorm(dim, scale_init=zero_init, rngs=rngs)
         self.attention = Attention(dim, num_heads)
         self.layer_scale1 = LayerScale(dim)
-        self.norm2 = nnx.LayerNorm(dim)
+        self.norm2 = nnx.LayerNorm(dim, rngs=rngs)
 
-        self.mlp = Mlp(dim, hidden=int(dim*mlp_ratio))
+        self.mlp = Mlp(dim, hidden=int(dim * mlp_ratio))
         self.layer_scale2 = LayerScale(dim)
 
     def __call__(self, x):
@@ -155,11 +168,19 @@ class Block(nnx.Module):
 
         return x
 
+
 class DinoViT(nnx.Module):
     def __init__(
-        self, img_size=518, patch_size=14, in_channels=3, embed_dim=384,
-        depth=12, num_heads=6, mlp_ratio=4, interpolate_offset=0.1,
-        num_reg_tokens=0 
+        self,
+        img_size=518,
+        patch_size=14,
+        in_channels=3,
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        mlp_ratio=4,
+        interpolate_offset=0.1,
+        num_reg_tokens=0,
     ):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
@@ -172,12 +193,16 @@ class DinoViT(nnx.Module):
         self.cls_token = nnx.Param(jnp.zeros((1, 1, embed_dim)))
         self.pos_embed = nnx.Param(jnp.zeros((1, 1370, embed_dim)))
 
-        self.register_tokens = nnx.Param(jnp.zeros((1, num_reg_tokens, embed_dim))) if num_reg_tokens else None
+        self.register_tokens = (
+            nnx.Param(jnp.zeros((1, num_reg_tokens, embed_dim)))
+            if num_reg_tokens
+            else None
+        )
 
-        self.layer = [Block(embed_dim, num_heads, mlp_ratio) for _ in range(depth)]
+        self.layers = [Block(embed_dim, num_heads, mlp_ratio) for _ in range(depth)]
         # self.layers = nnx.Sequential(*layer_list)
 
-        self.layernorm = nnx.LayerNorm(embed_dim)
+        self.layernorm = nnx.LayerNorm(embed_dim, rngs=rngs)
 
         self.mask_token = nnx.Param(jnp.zeros((1, embed_dim)))
 
@@ -197,10 +222,12 @@ class DinoViT(nnx.Module):
 
         kwargs = {}
         assert N == M * M
-        kwargs['size'] = (w0, h0)
+        kwargs["size"] = (w0, h0)
 
         patch_pos_embed = patch_pos_embed.reshape((1, M, M, dim)).transpose(0, 3, 1, 2)
-        patch_pos_embed = linear_bicubic_interpolate(patch_pos_embed, size=kwargs['size']).transpose(0, 2, 3, 1)
+        patch_pos_embed = linear_bicubic_interpolate(
+            patch_pos_embed, size=kwargs["size"]
+        ).transpose(0, 2, 3, 1)
 
         return jnp.concat((class_pos_embed[None], patch_pos_embed), axis=1)
 
@@ -221,24 +248,25 @@ class DinoViT(nnx.Module):
         return x
 
     def __call__(self, x, masks=None):
-        x = self._prepare_tokens_with_masks(x, masks) 
-        
-        for vitblock in self.layer:   
+        x = self._prepare_tokens_with_masks(x, masks)
+
+        for vitblock in self.layer:
             x = vitblock(x)
-            
+
         x = self.layernorm(x)
 
         return x
 
 
-def vit_small(patch_size=14, num_register_tokens=0, **kwargs):
-    return DinoViT(
-        img_size=518,
-        patch_size=patch_size,
-        embed_dim=384,
-        depth=12,
-        num_heads=6,
-        mlp_ratio=4,
-        num_register_tokens=num_register_tokens,
-        **kwargs,
-    )
+dino_model = DinoViT(
+    img_size=518,
+    patch_size=14,
+    embed_dim=384,
+    depth=12,
+    num_heads=6,
+    mlp_ratio=4,
+    num_reg_tokens=0,
+)
+
+# dino_model = vit_small().cuda()
+# dino_model
