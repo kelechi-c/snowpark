@@ -1,9 +1,25 @@
 # adapted from https://github.com/GallagherCommaJack/flux-jax and https://github.com/ayaka14732/llama-2-jax
 import jax.numpy as jnp
-import torch
+import torch, jax
 from torch import nn
 from flax import nnx
 from einops import rearrange
+import pickle
+from flax.serialization import to_state_dict
+from flax.core import freeze
+
+
+def save_modelpickle(model, filename="model.pkl"):
+    params = nnx.state(model)
+    params = jax.device_get(params)
+
+    state_dict = to_state_dict(params)
+    frozen_state_dict = freeze(state_dict)
+    # flat_state_dict = flax.traverse_util.flatten_dict(frozen_state_dict, sep=".")
+
+    with open(filename, "wb") as f:
+        pickle.dump(frozen_state_dict, f)
+
 
 
 def torch_embedding_to_jax_embedding(torch_embedding: nn.Embedding) -> nnx.Embed:
