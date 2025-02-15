@@ -24,11 +24,15 @@ class whisper_base_config:
 
 
 class WhisperAttention(nnx.Module):
-    def __init__(self, config: whisper_base_config, qkv_bias=False):
+    def __init__(self, config: whisper_base_config, is_decoder=False, is_causal=False, qkv_bias=False, layer_idx=None):
         super().__init__()
         dim = config.embed_dim
         self.num_attention_heads = config.attn_heads
         self.head_dim = dim // config.attn_heads
+        
+        self.is_causal = is_causal
+        self.is_decoder = is_decoder
+        self.layer_idx = layer_idx
 
         self.scale = self.head_dim**-0.5
         self.query = nnx.Linear(
@@ -45,14 +49,19 @@ class WhisperAttention(nnx.Module):
             dim, dim, rngs=rngs, kernel_init=xavier_init, bias_init=zero_init
         )
 
-    def __call__(self, x):
+    def __call__(self, x: Array, key_value: Array=None, mask: Array=None, past_key_value: Array=None):
         B, N, C = x.shape
+        
+        kv = key_value if key_value is not None else x 
+        
+        if self.is_causal and mask is None:
+            mask = jnp.ones((N, N))
 
         q = jnp.reshape(self.query(x), (B, N, self.num_attention_heads, self.head_dim))
-        k = jnp.reshape(self.key(x), (B, N, self.num_attention_heads, self.head_dim))
-        v = jnp.reshape(self.value(x), (B, N, self.num_attention_heads, self.head_dim))
+        k = jnp.reshape(self.key(kv), (B, N, self.num_attention_heads, self.head_dim))
+        v = jnp.reshape(self.value(kv), (B, N, self.num_attention_heads, self.head_dim))
 
-        x = nnx.dot_product_attention(q, k, v)
+        x = nnx.dot_product_attention(q, k, v, mask=mask)
         x = x.reshape((B, N, C))
         x = self.output(x)
 
@@ -121,3 +130,84 @@ class WhisperEncoder(nnx.Module):
 
         return hidden_state
 
+
+class WhisperDecoderLayer(nnx.Module):
+    def __init__(self, config: whisper_base_config, layer_idx):
+        super().__init__()
+        self.config = config
+        dim = config.embed_dim
+
+        self.self_attn = WhisperAttention(config, is_decoder=True, is_causal=True, layer_idx=layer_idx)
+        self.self_attn_layernorm = nnx.LayerNorm(dim, rngs=rngs)
+        self.cross_attn = WhisperAttention(config=config, is_decoder=True, is_causal=False, layer_idx=layer_idx)
+        self.cross_attn_norm = nnx.LayerNorm(dim)
+
+        self.linear_1 = nnx.Linear(
+            dim, config.ffn_dim, use_bias=False, kernel_init=xavier_init, rngs=rngs
+        )
+        self.linear_2 = nnx.Linear(
+            dim, config.ffn_dim, use_bias=False, kernel_init=xavier_init, rngs=rngs
+        )
+        self.final_layer_norm = nnx.LayerNorm(dim, rngs=rngs)
+        
+    def __call__(self, x_state: Array, attn_mask: Array=None, encoder_state: Array=None, encoder_mask: Array=None, past_kv: Array = None,)
+        residual = x_state
+        x_state = self.self_attn_layernorm(x_state)
+        
+        x_state = self.self_attn(x_state)
+        x_state = residual + x_state
+        
+        # cross attention 
+        residual = x_state
+        x_state = self.cross_attn_norm(x_state)
+        x_state = self.cross_attn(x_state, encoder_state)
+        x_state = residual + x_state
+        
+        # mlp part/fully-connected
+        residual = x_state
+        x_state = self.final_layer_norm(x_state)
+        x_state = nnx.gelu(self.linear_1(x_state))
+        x_state = self.linear_2(x_state)
+        x_state = residual + x_state
+        
+        return x_state
+    
+
+        
+class WhisperDecoder(nnx.Module):
+    def __init__(self, config: whisper_base_config):
+        super().__init__()
+        self.dtype = jnp.bfloat16
+        self.embed_tokens = nnx.Embed(config.vocab_size, config.embed_dim, dtype=self.dtype)
+        self.embed_positions = nnx.Embed(config.max_len, config.embed_dim)
+        
+        self.layers = [WhisperDecoderLayer(config, idx) for idx in range(config.decoder_depth)]
+        self.layernorm = nnx.LayerNorm(config.embed_dim)
+        
+    def __call__(self, x_ids, attn_mask=None, pos_ids=None, encoder_state=None) -> Array:
+        input_embeds = self.embed_tokens(x_ids)
+        position_embeds = self.embed_positions(pos_ids)
+        
+        x_state = input_embeds + position_embeds
+        
+        for decoder_layer in self.layers:
+            x_state = decoder_layer(x_state, attn_mask, encoder_state=encoder_state)
+        
+        x_state = self.layernorm(x_state)
+        
+        return x_state
+    
+class Whisper(nnx.Module):
+    def __init__(self, config: whisper_base_config):
+        super().__init__()
+        self.encoder = WhisperEncoder(config)
+        self.decoder = WhisperDecoder(config)
+        
+    def __call__(
+        self, x_input: Array, decoder_inputs: Array,
+        dec_attn_mask: Array, dec_pos_ids: Array
+    ) -> Array:
+        x_encoded = self.encoder(x_input)
+        x_decoded = self.decoder(x_encoded)
+        
+        return x_decoded
