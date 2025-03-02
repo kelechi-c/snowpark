@@ -9,9 +9,7 @@ from einops import rearrange
 from jax import Array
 import numpy as np
 from dinov2 import DinoViT
-from reference.hfmodels.dinov2.modeling_dinov2 import Dinov2Model
 from ..utils import (
-    torch_embedding_to_jax_embedding,
     torch_layernorm_to_jax_layernorm,
     torch_linear_to_jax_linear,
     torch_conv_to_jax_conv
@@ -87,23 +85,22 @@ def convert_dinov2(jax_model: DinoViT, torch_model):
     return jax_model
 
 
-# jax_dinov2 = convert_dinov2(dino_model, torch_model)
+jax_dinov2 = convert_dinov2(dino_model, torch_model)
 
-
-# saving utils
 
 from jax import random as jrand
 import optax
 
-rkey = jrand.key(0)
-
 def test_outputs(jax_model, torch_model):
-    rand_img = jrand.normal(rkey, (1, 224, 224, 3))
     rand_tensor = torch.randn(1, 3, 224, 224)
-    
+    rand_img = pt2jax(rand_tensor).transpose(0, 2, 3, 1)
+
+
     out_ours = jax_model(rand_img)
-    out_torch = jnp.array(torch_model(rand_tensor).detach().numpy())
-    
+    out_torch = jnp.array(torch_model(rand_tensor).last_hidden_state.detach().numpy())
     sim = optax.cosine_similarity(out_ours, out_torch)
-    optax.l
-    print(f'similarity: {sim:.3f}')
+
+    print(f"similarity: {sim.mean().item() * 100:.3f}%")
+
+
+# test_outputs(jax_dinov2, torch_model)
