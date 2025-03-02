@@ -63,23 +63,71 @@ class WhisperAttention(nnx.Module):
         key_value: Array = None,
         mask: Array = None,
         past_key_value: Array = None,
+        attention_mask: Array = None,
     ):
         B, N, C = x.shape
 
         kv = key_value if key_value is not None else x
 
-        if self.is_causal and mask is None:
-            mask = jnp.ones((N, N))
-
         q = jnp.reshape(self.query(x), (B, N, self.num_attention_heads, self.head_dim))
         k = jnp.reshape(self.key(kv), (B, N, self.num_attention_heads, self.head_dim))
         v = jnp.reshape(self.value(kv), (B, N, self.num_attention_heads, self.head_dim))
+
+        if past_key_value is not None:
+            # if past key value is not none, it means we are doing autoregressive decoding
+            # in this case
+            # k is (B, seq_len_kv, n_heads, head_dim)
+            # past key value is (2, B, seq_len_past, n_heads, head_dim)
+            past_key, past_value = past_key_value
+            k = jnp.concatenate([past_key, k], axis=1)
+            v = jnp.concatenate([past_value, v], axis=1)
+
+        if self.is_causal:
+            if attention_mask is None:
+                attention_mask = jnp.ones((N, N))
+
+            causal_mask = jnp.tril(jnp.ones((N, N)))
+
+            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+            causal_mask = jnp.expand_dims(causal_mask, axis=(-3, -2))
+
+            mask = attention_mask * causal_mask
+        else:
+            if attention_mask is not None:
+                mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+            else:
+                mask = None
 
         x = nnx.dot_product_attention(q, k, v, mask=mask)
         x = x.reshape((B, N, C))
         x = self.output(x)
 
         return x
+
+    # def __call__(
+    #     self,
+    #     x: Array,
+    #     key_value: Array = None,
+    #     mask: Array = None,
+    #     past_key_value: Array = None,
+    # ):
+    #     """Edit this block to match the forward pass for FlaxWhisperAttention in @reference/modeling_flax_whisper.py"""
+    #     B, N, C = x.shape
+
+    #     kv = key_value if key_value is not None else x
+
+    #     if self.is_causal and mask is None:
+    #         mask = jnp.ones((N, N))
+
+    #     q = jnp.reshape(self.query(x), (B, N, self.num_attention_heads, self.head_dim))
+    #     k = jnp.reshape(self.key(kv), (B, N, self.num_attention_heads, self.head_dim))
+    #     v = jnp.reshape(self.value(kv), (B, N, self.num_attention_heads, self.head_dim))
+
+    #     x = nnx.dot_product_attention(q, k, v, mask=mask)
+    #     x = x.reshape((B, N, C))
+    #     x = self.output(x)
+
+    #     return x
 
 
 class WhisperEncoderLayer(nnx.Module):
@@ -97,9 +145,9 @@ class WhisperEncoderLayer(nnx.Module):
         )
         self.final_norm = nnx.LayerNorm(dim, rngs=rngs)
 
-    def __call__(self, x: Array):
+    def __call__(self, x: Array, mask = None) -> Array:
         res = x
-        x = res + self.attention(self.attn_norm(x))
+        x = res + self.attention(self.attn_norm(x), attention_mask=mask)
 
         res = x
         x = nnx.gelu(self.linear_1(self.final_norm(x)))
@@ -186,13 +234,13 @@ class WhisperDecoderLayer(nnx.Module):
         residual = x_state
         x_state = self.self_attn_layernorm(x_state)
 
-        x_state = self.self_attn(x_state)
+        x_state = self.self_attn(x_state, attention_mask=attn_mask)
         x_state = residual + x_state
 
         # cross attention
         residual = x_state
         x_state = self.cross_attn_norm(x_state)
-        x_state = self.cross_attn(x_state, encoder_state)
+        x_state = self.cross_attn(x_state, key_value=encoder_state, attention_mask=encoder_mask)
         x_state = residual + x_state
 
         # mlp part/fully-connected
@@ -220,15 +268,25 @@ class WhisperDecoder(nnx.Module):
         self.layernorm = nnx.LayerNorm(config.embed_dim, rngs=rngs)
 
     def __call__(
-        self, x_ids, attn_mask=None, pos_ids=None, encoder_state=None
+        self, x_ids, attn_mask=None, pos_ids=None,
+        encoder_state=None, encoder_mask=None, past_key_values=None
     ) -> Array:
         input_embeds = self.embed_tokens(x_ids)
         position_embeds = self.embed_positions(pos_ids)
 
         x_state = input_embeds + position_embeds
 
-        for decoder_layer in self.layers:
-            x_state = decoder_layer(x_state, attn_mask, encoder_state=encoder_state)
+        if past_key_values == None:
+            past_key_values = [None] * len(self.layers)
+
+        for idx, decoder_layer in enumerate(self.layers):
+            x_state = decoder_layer(
+                x_state,
+                attn_mask,
+                encoder_state=encoder_state,
+                encoder_mask=encoder_mask,
+                past_kv=past_key_values[idx],
+            )
 
         x_state = self.layernorm(x_state)
 
@@ -240,6 +298,8 @@ class Whisper(nnx.Module):
         super().__init__()
         self.encoder = WhisperEncoder(config)
         self.decoder = WhisperDecoder(config)
+        self.linear_head = nnx.Linear(config.embed_dim, config.vocab_size, rngs=rngs, use_bias=False)
+        self.max_target_positions = config.max_len
 
     def __call__(
         self,
@@ -247,11 +307,21 @@ class Whisper(nnx.Module):
         decoder_inputs: Array,
         dec_attn_mask: Array,
         dec_pos_ids: Array,
+        enc_attn_mask: Array,
+        past_key_values=None,
     ) -> Array:
         x_encoded = self.encoder(x_input)
-        x_decoded = self.decoder(x_encoded)
-
-        return x_decoded
+        x_decoded = self.decoder(
+            x_ids=decoder_inputs,
+            attn_mask=dec_attn_mask,
+            pos_ids=dec_pos_ids,
+            encoder_state=x_encoded,
+            encoder_mask=enc_attn_mask,
+            past_key_values=past_key_values
+        )
+        x_out = self.linear_head(x_decoded)
+        
+        return x_out
 
 
 whisper_model = Whisper(whisper_base_config)
