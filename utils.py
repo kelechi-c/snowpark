@@ -3,10 +3,29 @@ import jax.numpy as jnp
 import torch, jax
 from torch import nn
 from flax import nnx
+from jax import Array
 from einops import rearrange
 import pickle
 from flax.serialization import to_state_dict
 from flax.core import freeze
+import numpy as np
+
+
+def jax2np(x: Array) -> np.ndarray:
+    return np.asarray(x)
+
+
+def np2jax(x: np.ndarray) -> Array:
+    return jnp.asarray(x)
+
+
+def pt2np(x: torch.Tensor) -> np.ndarray:
+    with torch.no_grad():
+        return x.numpy()
+
+
+def pt2jax(x: torch.Tensor) -> Array:
+    return np2jax(pt2np(x))
 
 
 def save_modelpickle(model, filename="model.pkl"):
@@ -19,7 +38,6 @@ def save_modelpickle(model, filename="model.pkl"):
 
     with open(filename, "wb") as f:
         pickle.dump(frozen_state_dict, f)
-
 
 
 def torch_embedding_to_jax_embedding(torch_embedding: nn.Embedding) -> nnx.Embed:
@@ -68,16 +86,19 @@ def torch_layernorm_to_jax_layernorm(
     return jax_layernorm
 
 
-def torch_conv_to_jax_conv(torch_conv: nn.Conv2d) -> nnx.Conv:
-    dense: nnx.Linear = nnx.eval_shape(
-        lambda: nnx.Linear(
+def torch_conv_to_jax_conv(torch_conv: torch.nn.Conv2d) -> nnx.Conv:
+    dense: nnx.Conv = nnx.eval_shape(
+        lambda: nnx.Conv(
             in_features=torch_conv.in_channels,
             out_features=torch_conv.out_channels,
+            kernel_size=torch_conv.kernel_size,
+            strides=torch_conv.stride,
+            padding=torch_conv.padding,
             use_bias=torch_conv.bias is not None,
             rngs=nnx.Rngs(0),
         )
     )
-    res_weight = rearrange(torch_conv.weight, "d c h w -> h w c d")
+    res_weight = rearrange(torch_conv.weight, 'd c h w -> h w c d')
     dense.kernel.value = jnp.array(res_weight.detach().numpy())
     if torch_conv.bias is not None:
         dense.bias.value = jnp.array(torch_conv.bias.detach().numpy())
