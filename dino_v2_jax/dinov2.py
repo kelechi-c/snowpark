@@ -13,19 +13,15 @@ xavier_init = nnx.initializers.xavier_uniform()
 zero_init = nnx.initializers.constant(0)
 
 
-def linear_bicubic_interpolate(x, size=None):
-    in_shape = x.shape
+def linear_bicubic_interpolate(patch_pos_embed, M, dim, target_size, **kwargs):
 
-    scale_factors = tuple(o / i for o, i in zip(size, in_shape[2:]))
-
-    n, c, l_out = jnp.indices((x.shape[0], x.shape[1]) + size)
-    l_in_float = l_out / scale_factors[0]
-    l_in = jnp.floor(l_in_float).astype(int)
-    l_in_next = jnp.clip(l_in + 1, 0, in_shape[2] - 1)
-    l_weight = l_in_float - l_in
-    interpolated_values = (1 - l_weight) * x[n, c, l_in] + l_weight * x[n, c, l_in_next]
-
-    return interpolated_values
+    reshaped = patch_pos_embed.reshape(
+        M, M, dim
+    )  # remove batch dimension for jax resize
+    resized = jax.image.resize(reshaped, shape=target_size + (dim,), method="bicubic")
+    # Add back the batch dimension and change data format to pytorch's NCHW
+    resized = jnp.expand_dims(resized.transpose(2, 0, 1), axis=0)
+    return resized
 
 
 class Mlp(nnx.Module):
@@ -76,6 +72,7 @@ class PatchEmbed(nnx.Module):
     def __init__(self, img_size=224, patch_size=16, in_channel=3, embed_dim=768):
         super().__init__()
         img_size = (img_size, img_size)
+        self.patch_size = patch_size
         patch_size = (patch_size, patch_size)
 
         self.num_channels = in_channel
@@ -199,7 +196,7 @@ class DinoViT(nnx.Module):
             else None
         )
 
-        self.layers = [Block(embed_dim, num_heads, mlp_ratio) for _ in range(depth)]
+        self.layer = [Block(embed_dim, num_heads, mlp_ratio) for _ in range(depth)]
         # self.layers = nnx.Sequential(*layer_list)
 
         self.layernorm = nnx.LayerNorm(embed_dim, rngs=rngs)
@@ -213,7 +210,7 @@ class DinoViT(nnx.Module):
         if npatches == N and w == h:
             return self.pos_embed.value
 
-        pos_embed = self.pos_embed.value.float()
+        pos_embed = self.pos_embed.value
         class_pos_embed = pos_embed[:, 0]
         patch_pos_embed = pos_embed[:, 1:]
         dim = x.shape[-1]
@@ -225,11 +222,21 @@ class DinoViT(nnx.Module):
         kwargs["size"] = (w0, h0)
 
         patch_pos_embed = patch_pos_embed.reshape((1, M, M, dim)).transpose(0, 3, 1, 2)
-        patch_pos_embed = linear_bicubic_interpolate(
-            patch_pos_embed, size=kwargs["size"]
-        ).transpose(0, 2, 3, 1)
+        patch_pos_embed = (
+            linear_bicubic_interpolate(
+                patch_pos_embed, M, dim, target_size=kwargs["size"]
+            )
+            .transpose(0, 2, 3, 1)
+            .reshape((1, -1, dim))
+        )
 
-        return jnp.concat((class_pos_embed[None], patch_pos_embed), axis=1)
+        class_pos_embed = class_pos_embed[None]
+        # patch_pos_embed = patch_pos_embed[None]
+        # print(f"{class_pos_embed.shape = }")
+        # print(f"{patch_pos_embed.shape = }")
+        interp_out = jnp.concat((class_pos_embed, patch_pos_embed), axis=1)
+
+        return interp_out
 
     def _prepare_tokens_with_masks(self, x, masks=None):
         b, h, w, c = x.shape
@@ -241,6 +248,7 @@ class DinoViT(nnx.Module):
         x = jnp.concat([exp_cls, x], axis=1)
 
         x = x + self.interpolate_posencoding(x, h, w)
+        print(f"interp {x.shape = }")
         if self.register_tokens is not None:
             exp_reg = jnp.repeat(self.register_tokens.value, b, axis=0)
             x = jnp.concat([x[:, :1], exp_reg, x[:, 1:]])
