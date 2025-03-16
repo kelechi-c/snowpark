@@ -1,14 +1,10 @@
-from functools import partial
-import math
-import torch
-
 # Adapted from https://github.com/cloneofsimo/minDinoV2
 import jax, math
 from jax import Array, numpy as jnp
 from flax import nnx
 from einops import rearrange
 
-rngs = nnx.Rngs(123)
+rngs = nnx.Rngs(0)
 xavier_init = nnx.initializers.xavier_uniform()
 zero_init = nnx.initializers.constant(0)
 
@@ -20,7 +16,7 @@ def linear_bicubic_interpolate(patch_pos_embed, M, dim, target_size, **kwargs):
     )  # remove batch dimension for jax resize
     resized = jax.image.resize(reshaped, shape=target_size + (dim,), method="bicubic")
     # Add back the batch dimension and change data format to pytorch's NCHW
-    resized = jnp.expand_dims(resized.transpose(2, 0, 1), axis=0)
+    resized = jnp.expand_dims(resized, axis=0)
     return resized
 
 
@@ -45,27 +41,6 @@ class Mlp(nnx.Module):
         x = self.fc2(x)
 
         return x
-
-
-class SwigluFFN(nnx.Module):
-    def __init__(self, infeat, hidden):
-        super().__init__()
-        outfeat = infeat
-        hidden = hidden or infeat
-
-        self.weights_in = nnx.Linear(
-            infeat, 2 * hidden, use_bias=False, kernel_init=xavier_init, rngs=rngs
-        )
-        self.weights_out = nnx.Linear(
-            hidden, outfeat, kernel_init=xavier_init, use_bias=True, rngs=rngs
-        )
-
-    def __call__(self, x):
-        x_12 = self.weights_in(x)
-        x_1, x_2 = jnp.array_split(x_12, 2, axis=-1)
-        hidden = nnx.silu(x_1) * x_2
-
-        return self.weights_out(hidden)
 
 
 class PatchEmbed(nnx.Module):
@@ -275,6 +250,3 @@ dino_model = DinoViT(
     mlp_ratio=4,
     num_reg_tokens=0,
 )
-
-# dino_model = vit_small().cuda()
-# dino_model
