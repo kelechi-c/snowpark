@@ -1,4 +1,4 @@
-## snowflake ❄️
+## snowpark ❄️
 
 research/experiments on **multimodal** models, **adapters**, etc. (the implementations are in **JAX** btw)
 

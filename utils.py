@@ -103,3 +103,22 @@ def torch_conv_to_jax_conv(torch_conv: torch.nn.Conv2d) -> nnx.Conv:
     if torch_conv.bias is not None:
         dense.bias.value = jnp.array(torch_conv.bias.detach().numpy())
     return dense
+
+
+def torch_rmsnorm_to_jax_rmsnorm(
+    torch_rmsnorm: torch.nn.RMSNorm,
+) -> nnx.RMSNorm:
+    jax_rmsnorm: nnx.RMSNorm = nnx.eval_shape(
+        lambda: nnx.RMSNorm(
+            num_features=torch_rmsnorm.normalized_shape[0],
+            epsilon=torch_rmsnorm.eps,
+            use_bias=torch_rmsnorm.bias is not None,
+            use_scale=torch_rmsnorm.weight is not None,
+            rngs=nnx.Rngs(0),
+        )
+    )
+
+    if torch_rmsnorm.weight is not None:
+        jax_rmsnorm.scale.value = jnp.array(torch_rmsnorm.weight.detach().numpy())
+
+    return jax_rmsnorm
