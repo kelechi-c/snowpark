@@ -75,17 +75,19 @@ def convert_dinov2(jax_model: DinoViT, torch_model):
     jax_model.pos_embed.value = jnp.array(
         torch_model.embeddings.position_embeddings.detach().numpy()
     )
-    jax_model.layer = [
-        convert_vit_layer(jax_model.layer[x], torch_model.encoder.layer[x])
-        for x in range(jax_model.depth)
-    ]
+    
+    for x in range(jax_model.depth):
+        _block = getattr(jax_model, f"blocks_{x}")
+        _block = convert_vit_layer(_block, torch_model.encoder.layer[x])
+        setattr(jax_model, f"blocks_{x}", _block)
+        
     jax_model.layernorm = torch_layernorm_to_jax_layernorm(torch_model.layernorm)
     print("Dinov2-jax online")
 
     return jax_model
 
 
-jax_dinov2 = convert_dinov2(dino_model, torch_model)
+# jax_dinov2 = convert_dinov2(dino_model, torch_model)
 
 
 from jax import random as jrand

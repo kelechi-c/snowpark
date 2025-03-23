@@ -170,9 +170,9 @@ class DinoViT(nnx.Module):
             if num_reg_tokens
             else None
         )
-
-        self.layer = [Block(embed_dim, num_heads, mlp_ratio) for _ in range(depth)]
-        # self.layers = nnx.Sequential(*layer_list)
+        for i in range(depth):
+            block = Block(embed_dim, num_heads, mlp_ratio)
+            setattr(self, f"blocks_{i}", block)
 
         self.layernorm = nnx.LayerNorm(embed_dim, rngs=rngs)
 
@@ -233,8 +233,9 @@ class DinoViT(nnx.Module):
     def __call__(self, x, masks=None):
         x = self._prepare_tokens_with_masks(x, masks)
 
-        for vitblock in self.layer:
-            x = vitblock(x)
+        for i in range(self.depth):
+            _block = getattr(self, f"blocks_{i}")
+            x = _block(x)
 
         x = self.layernorm(x)
 
